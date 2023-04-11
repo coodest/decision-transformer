@@ -18,6 +18,7 @@ import pickle
 import blosc
 import argparse
 from create_dataset import create_dataset
+from tools import IO
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--seed', type=int, default=123)
@@ -53,7 +54,7 @@ class StateActionReturnDataset(Dataset):
         block_size = self.block_size // 3
         done_idx = idx + block_size
         for i in self.done_idxs:
-            if i > idx: # first done_idx greater than idx
+            if i > idx:  # first done_idx greater than idx
                 done_idx = min(int(i), done_idx)
                 break
         idx = done_idx - block_size
@@ -65,7 +66,14 @@ class StateActionReturnDataset(Dataset):
 
         return states, actions, rtgs, timesteps
 
-obss, actions, returns, done_idxs, rtgs, timesteps = create_dataset(args.num_buffers, args.num_steps, args.game, args.data_dir_prefix, args.trajectories_per_buffer)
+
+dataset_dump_path = "dataset.pkl"
+try:
+    [obss, actions, returns, done_idxs, rtgs, timesteps] = IO.read_disk_dump(dataset_dump_path)
+except Exception:
+    obss, actions, returns, done_idxs, rtgs, timesteps = create_dataset(args.num_buffers, args.num_steps, args.game, args.data_dir_prefix, args.trajectories_per_buffer)
+    IO.write_disk_dump(dataset_dump_path, [obss, actions, returns, done_idxs, rtgs, timesteps])
+
 
 # set up logging
 logging.basicConfig(
@@ -75,6 +83,7 @@ logging.basicConfig(
 )
 
 train_dataset = StateActionReturnDataset(obss, args.context_length*3, actions, done_idxs, rtgs, timesteps)
+
 
 mconf = GPTConfig(train_dataset.vocab_size, train_dataset.block_size,
                   n_layer=6, n_head=8, n_embd=128, model_type=args.model_type, max_timestep=max(timesteps))

@@ -85,51 +85,58 @@ class Trainer:
             data = self.train_dataset if is_train else self.test_dataset
             loader = DataLoader(data, shuffle=True, pin_memory=True,
                                 batch_size=config.batch_size,
-                                num_workers=config.num_workers)
+                                num_workers=config.num_workers,
+                                prefetch_factor=2)
 
             losses = []
             pbar = tqdm(enumerate(loader), total=len(loader)) if is_train else enumerate(loader)
             for it, (x, y, r, t) in pbar:
+                with torch.profiler.profile(
+                    activities=[
+                        torch.profiler.ProfilerActivity.CPU,
+                        torch.profiler.ProfilerActivity.CUDA,
+                    ]
+                ) as p:
+                    # place data on the correct device
+                    x = x.to(self.device)
+                    y = y.to(self.device)
+                    r = r.to(self.device)
+                    t = t.to(self.device)
 
-                # place data on the correct device
-                x = x.to(self.device)
-                y = y.to(self.device)
-                r = r.to(self.device)
-                t = t.to(self.device)
+                    # forward the model
+                    with torch.set_grad_enabled(is_train):
+                        # logits, loss = model(x, y, r)
+                        logits, loss = model(x, y, y, r, t)
+                        loss = loss.mean() # collapse all losses if they are scattered on multiple gpus
+                        losses.append(loss.item())
 
-                # forward the model
-                with torch.set_grad_enabled(is_train):
-                    # logits, loss = model(x, y, r)
-                    logits, loss = model(x, y, y, r, t)
-                    loss = loss.mean() # collapse all losses if they are scattered on multiple gpus
-                    losses.append(loss.item())
+                    if is_train:
 
-                if is_train:
+                        # backprop and update the parameters
+                        model.zero_grad()
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_norm_clip)
+                        optimizer.step()
 
-                    # backprop and update the parameters
-                    model.zero_grad()
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_norm_clip)
-                    optimizer.step()
-
-                    # decay the learning rate based on our progress
-                    if config.lr_decay:
-                        self.tokens += (y >= 0).sum() # number of tokens processed this step (i.e. label is not -100)
-                        if self.tokens < config.warmup_tokens:
-                            # linear warmup
-                            lr_mult = float(self.tokens) / float(max(1, config.warmup_tokens))
+                        # decay the learning rate based on our progress
+                        if config.lr_decay:
+                            self.tokens += (y >= 0).sum() # number of tokens processed this step (i.e. label is not -100)
+                            if self.tokens < config.warmup_tokens:
+                                # linear warmup
+                                lr_mult = float(self.tokens) / float(max(1, config.warmup_tokens))
+                            else:
+                                # cosine learning rate decay
+                                progress = float(self.tokens - config.warmup_tokens) / float(max(1, config.final_tokens - config.warmup_tokens))
+                                lr_mult = max(0.1, 0.5 * (1.0 + math.cos(math.pi * progress)))
+                            lr = config.learning_rate * lr_mult
+                            for param_group in optimizer.param_groups:
+                                param_group['lr'] = lr
                         else:
-                            # cosine learning rate decay
-                            progress = float(self.tokens - config.warmup_tokens) / float(max(1, config.final_tokens - config.warmup_tokens))
-                            lr_mult = max(0.1, 0.5 * (1.0 + math.cos(math.pi * progress)))
-                        lr = config.learning_rate * lr_mult
-                        for param_group in optimizer.param_groups:
-                            param_group['lr'] = lr
-                    else:
-                        lr = config.learning_rate
+                            lr = config.learning_rate
 
-                    # report progress
-                    pbar.set_description(f"epoch {epoch+1} iter {it}: train loss {loss.item():.5f}. lr {lr:e}")
+                        # report progress
+                        pbar.set_description(f"epoch {epoch+1} iter {it}: train loss {loss.item():.5f}. lr {lr:e}")
+                print(p.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1))
 
             if not is_train:
                 test_loss = float(np.mean(losses))
@@ -143,8 +150,15 @@ class Trainer:
         self.tokens = 0 # counter used for learning rate decay
 
         for epoch in range(config.max_epochs):
-
+            # with torch.profiler.profile(
+            #     activities=[
+            #         torch.profiler.ProfilerActivity.CPU,
+            #         torch.profiler.ProfilerActivity.CUDA,
+            #     ]
+            # ) as p:
+            # print(p.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1))
             run_epoch('train', epoch_num=epoch)
+            
             # if self.test_dataset is not None:
             #     test_loss = run_epoch('test')
 
@@ -166,6 +180,8 @@ class Trainer:
                     eval_return = self.get_returns(14000)
                 elif self.config.game == 'Pong':
                     eval_return = self.get_returns(20)
+                elif self.config.game == "StarGunner":
+                    eval_return = self.get_returns(10000)
                 else:
                     raise NotImplementedError()
             else:
